@@ -898,3 +898,405 @@ class VirtualHereManager:
                         'vendor_id': parts[2],
                         'product_id': parts[3],
                         'description': parts[4],
+                        'in_use': len(parts) > 5 and parts[5] == '1',
+                        'full_address': f"{parts[0]}.{parts[1]}"
+                    }
+                    
+                    # Filter for iOS devices (Apple vendor ID: 05ac)
+                    if parts[2].lower() == '05ac':
+                        devices.append(device)
+        
+        return devices
+    
+    def use_device(self, device_address):
+        """Connect to a USB device"""
+        response = self.send_command(f"USE,{device_address}")
+        success = response and "OK" in response
+        
+        if success:
+            print(f"📱 Connected to device: {device_address}")
+        else:
+            print(f"❌ Failed to connect to device: {device_address}")
+            
+        return success
+    
+    def stop_using_device(self, device_address):
+        """Disconnect from a USB device"""
+        response = self.send_command(f"STOP USING,{device_address}")
+        success = response and "OK" in response
+        
+        if success:
+            print(f"🔌 Disconnected from device: {device_address}")
+        else:
+            print(f"❌ Failed to disconnect from device: {device_address}")
+            
+        return success
+
+class ProgramDisplayManager:
+    def __init__(self, program_path):
+        self.program_path = program_path
+        self.program_process = None
+        self.is_displayed = False
+        
+    def show_program(self):
+        """Show program in fullscreen"""
+        try:
+            print(f"🚀 Launching {os.path.basename(self.program_path)}")
+            
+            # Launch the program
+            if self.program_path.endswith('.app'):
+                self.program_process = subprocess.Popen(['open', '-a', self.program_path])
+            else:
+                self.program_process = subprocess.Popen([self.program_path])
+            
+            # Wait for launch
+            time.sleep(3)
+            
+            # Get program name
+            program_name = os.path.basename(self.program_path).replace('.app', '')
+            
+            # Make fullscreen and hide desktop
+            applescript = f'''
+            tell application "{program_name}"
+                activate
+                delay 1
+            end tell
+            
+            tell application "System Events"
+                tell process "{program_name}"
+                    set frontmost to true
+                    delay 0.5
+                    try
+                        keystroke "f" using {{control down, command down}}
+                    on error
+                        try
+                            keystroke "f" using {{command down}}
+                        end try
+                    end try
+                end tell
+            end tell
+            '''
+            
+            subprocess.run(['osascript', '-e', applescript], 
+                          capture_output=True, timeout=15)
+            
+            self.is_displayed = True
+            print("✅ Program displayed in fullscreen")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error showing program: {e}")
+            return False
+    
+    def hide_program(self):
+        """Hide program and restore desktop"""
+        if not self.is_displayed:
+            return
+            
+        try:
+            program_name = os.path.basename(self.program_path).replace('.app', '')
+            
+            applescript = f'''
+            tell application "{program_name}"
+                set miniaturized of every window to true
+            end tell
+            '''
+            
+            subprocess.run(['osascript', '-e', applescript], 
+                          capture_output=True, timeout=10)
+            
+            self.is_displayed = False
+            print("🙈 Program hidden")
+            
+        except Exception as e:
+            print(f"❌ Error hiding program: {e}")
+
+class USBTestingStation:
+    def __init__(self, program_path, virtualhere_host="localhost", virtualhere_port=7575, 
+                 web_port=8080, auto_install=True):
+        self.vh_installer = VirtualHereInstaller()
+        self.vh_manager = VirtualHereManager(virtualhere_host, virtualhere_port)
+        self.display_manager = ProgramDisplayManager(program_path)
+        self.current_device = None
+        self.device_queue = Queue()
+        self.session_start_time = None
+        self.is_running = False
+        self.auto_install = auto_install
+        self.vh_process = None
+        self.web_port = web_port
+        self.web_server = None
+        self.program_name = os.path.basename(program_path).replace('.app', '')
+        
+    def start(self):
+        """Start the testing station"""
+        print("🚀 Starting USB Testing Station with Web Interface...")
+        
+        # Install and start VirtualHere client if needed
+        if self.auto_install:
+            print("📦 Setting up VirtualHere client...")
+            
+            if not self.vh_installer.install():
+                print("❌ Failed to install VirtualHere client")
+                return False
+            
+            # Start VirtualHere client
+            self.vh_process = self.vh_installer.start_client(background=True)
+            if not self.vh_process:
+                print("❌ Failed to start VirtualHere client")
+                return False
+            
+            # Wait for client to be ready
+            print("⏳ Waiting for VirtualHere client to initialize...")
+            time.sleep(5)
+        
+        # Connect to VirtualHere
+        if not self.vh_manager.connect():
+            print("❌ Cannot start without VirtualHere connection")
+            if self.vh_process:
+                self.vh_installer.stop_client()
+            return False
+        
+        # Show program
+        if not self.display_manager.show_program():
+            print("❌ Cannot start without program display")
+            self.vh_manager.disconnect()
+            if self.vh_process:
+                self.vh_installer.stop_client()
+            return False
+        
+        # Start web server
+        if not self.start_web_server():
+            print("❌ Cannot start without web server")
+            self.stop()
+            return False
+        
+        # Start monitoring
+        self.is_running = True
+        self.monitor_thread = threading.Thread(target=self.monitor_devices, daemon=True)
+        self.monitor_thread.start()
+        
+        self.session_thread = threading.Thread(target=self.manage_sessions, daemon=True)
+        self.session_thread.start()
+        
+        print("✅ Testing station started!")
+        print(f"🌐 Web interface: http://localhost:{self.web_port}")
+        print("👀 Users can connect via web browser to see and control your app")
+        print("📱 Waiting for USB device connections...")
+        
+        return True
+    
+    def start_web_server(self):
+        """Start the web server for remote display"""
+        try:
+            print(f"🌐 Starting web server on port {self.web_port}...")
+            
+            # Create web server
+            self.web_server = WebDisplayServer(
+                ('0.0.0.0', self.web_port), 
+                WebDisplayHandler,
+                station=self,
+                program_name=self.program_name
+            )
+            
+            # Start server in background thread
+            self.web_server_thread = threading.Thread(
+                target=self.web_server.serve_forever, 
+                daemon=True
+            )
+            self.web_server_thread.start()
+            
+            print(f"✅ Web server started on http://0.0.0.0:{self.web_port}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to start web server: {e}")
+            return False
+    
+    def stop_web_server(self):
+        """Stop the web server"""
+        if self.web_server:
+            try:
+                self.web_server.shutdown()
+                self.web_server.server_close()
+                print("🌐 Web server stopped")
+            except Exception as e:
+                print(f"❌ Error stopping web server: {e}")
+    
+    def stop(self):
+        """Stop the testing station"""
+        print("🛑 Stopping testing station...")
+        
+        self.is_running = False
+        
+        # Disconnect current device
+        if self.current_device:
+            self.vh_manager.stop_using_device(self.current_device['full_address'])
+        
+        # Stop web server
+        self.stop_web_server()
+        
+        # Hide program
+        self.display_manager.hide_program()
+        
+        # Disconnect VirtualHere
+        self.vh_manager.disconnect()
+        
+        # Stop VirtualHere client if we started it
+        if self.vh_process:
+            self.vh_installer.stop_client()
+        
+        print("✅ Testing station stopped")
+    
+    def monitor_devices(self):
+        """Monitor for new device connections"""
+        while self.is_running:
+            try:
+                devices = self.vh_manager.list_devices()
+                
+                # Find new iOS devices
+                for device in devices:
+                    if not device['in_use'] and device['full_address'] not in [d.get('full_address') for d in [self.current_device] if d]:
+                        print(f"📱 New iOS device detected: {device['description']}")
+                        
+                        if not self.current_device:
+                            self.connect_device(device)
+                        else:
+                            self.add_to_queue(device)
+                
+                time.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                print(f"❌ Monitor error: {e}")
+                time.sleep(10)
+    
+    def connect_device(self, device):
+        """Connect to a device and start session"""
+        if self.vh_manager.use_device(device['full_address']):
+            self.current_device = device
+            self.session_start_time = datetime.now()
+            
+            print(f"🎯 Session started: {device['description']}")
+            print("⏰ 60 second session timer started")
+    
+    def add_to_queue(self, device):
+        """Add device to queue"""
+        self.device_queue.put(device)
+        queue_size = self.device_queue.qsize()
+        print(f"⏳ Device queued: {device['description']} (Position: {queue_size})")
+    
+    def manage_sessions(self):
+        """Manage session timeouts and queue"""
+        while self.is_running:
+            try:
+                # Check session timeout
+                if self.current_device and self.session_start_time:
+                    elapsed = datetime.now() - self.session_start_time
+                    
+                    if elapsed.seconds >= 60:  # 1 minute timeout
+                        print(f"⏰ Session timeout: {self.current_device['description']}")
+                        self.end_current_session()
+                
+                # Process queue
+                if not self.current_device and not self.device_queue.empty():
+                    next_device = self.device_queue.get()
+                    print(f"📱 Processing queued device: {next_device['description']}")
+                    self.connect_device(next_device)
+                
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"❌ Session management error: {e}")
+                time.sleep(5)
+    
+    def end_current_session(self):
+        """End current device session"""
+        if self.current_device:
+            device_addr = self.current_device['full_address']
+            device_desc = self.current_device['description']
+            
+            self.vh_manager.stop_using_device(device_addr)
+            
+            print(f"🔚 Session ended: {device_desc}")
+            
+            self.current_device = None
+            self.session_start_time = None
+
+def main():
+    parser = argparse.ArgumentParser(description='VirtualHere USB Testing Station with Web Interface')
+    parser.add_argument('--program', required=True,
+                       help='Path to your testing program')
+    parser.add_argument('--server', default='localhost',
+                       help='VirtualHere server host (default: localhost)')
+    parser.add_argument('--port', type=int, default=7575,
+                       help='VirtualHere server port (default: 7575)')
+    parser.add_argument('--web-port', type=int, default=8080,
+                       help='Web server port (default: 8080)')
+    parser.add_argument('--action', choices=['start', 'stop', 'status', 'install-only'],
+                       default='start',
+                       help='Action to perform')
+    parser.add_argument('--no-auto-install', action='store_true',
+                       help='Skip automatic VirtualHere installation')
+    
+    args = parser.parse_args()
+    
+    # Check for required dependencies
+    try:
+        import pyautogui
+        from PIL import Image, ImageGrab
+    except ImportError as e:
+        print(f"❌ Missing required dependency: {e}")
+        print("💡 Install with: pip3 install pyautogui pillow")
+        sys.exit(1)
+    
+    # Validate program
+    if args.action != 'install-only' and not os.path.exists(args.program):
+        print(f"❌ Program not found: {args.program}")
+        sys.exit(1)
+    
+    auto_install = not args.no_auto_install
+    
+    if args.action == 'install-only':
+        print("📦 Installing VirtualHere client only...")
+        installer = VirtualHereInstaller()
+        if installer.install():
+            print("✅ VirtualHere client installed successfully")
+            print(f"📍 Location: {installer.client_path}")
+        else:
+            print("❌ Failed to install VirtualHere client")
+            sys.exit(1)
+        return
+    
+    print(f"🎯 Program: {args.program}")
+    print(f"🌐 VirtualHere: {args.server}:{args.port}")
+    print(f"🌐 Web Interface: http://localhost:{args.web_port}")
+    print(f"📦 Auto-install: {'Yes' if auto_install else 'No'}")
+    
+    station = USBTestingStation(
+        args.program, 
+        args.server, 
+        args.port, 
+        args.web_port,
+        auto_install
+    )
+    
+    if args.action == 'start':
+        if station.start():
+            try:
+                print("\n" + "="*60)
+                print("🎮 TESTING STATION RUNNING")
+                print("="*60)
+                print(f"🌐 Remote users can connect to: http://your-ip:{args.web_port}")
+                print("👀 They will see and control your testing app through browser")
+                print("📱 USB devices connect via VirtualHere")
+                print("⌨️  Commands: Ctrl+C to stop")
+                print("="*60)
+                
+                while station.is_running:
+                    time.sleep(1)
+                        
+            except KeyboardInterrupt:
+                print("\n🛑 Stopping...")
+                station.stop()
+
+if __name__ == "__main__":
+    main()
